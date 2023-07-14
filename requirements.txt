@@ -1,0 +1,4 @@
+streamlit
+elasticsearch
+jinja2
+boto3
