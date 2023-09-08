@@ -9,46 +9,67 @@ import os
 import streamlit as st
 from elasticsearch import Elasticsearch
 from typing import List, Tuple, Dict
+from langchain.llms.bedrock import Bedrock
 import boto3
 import botocore
+from cohere_sagemaker import Client
 
-
-flan_t5_endpoint_name = os.environ["FLAN_T5_ENDPOINT"]
-falcon_40b_endpoint_name = os.environ["FALCON_40B_ENDPOINT"]
+# AWS / Cohere Settings
+cohere_light_endpoint_name = os.environ["COHERE_LIGHT_ENDPOINT"]
 aws_region = os.environ["AWS_REGION"]
+max_tokens=2048
+max_context_tokens=4000
+safety_margin=5
+
+### Elastic Settings
+
+#cluster Settings
 cid = os.environ['ES_CLOUD_ID']
 cp = os.environ['ES_PASSWORD']
 cu = os.environ['ES_USERNAME']
-max_tokens=1024
-max_context_tokens=2000
-safety_margin=5
 
-LLM_LIST: List[str] = ["Falcon-40B-Instruct","Flan-T5-XXL"]
-INDEX_LIST: List[str] = ["search-elastic-docs", "anyitcompany"]
+# ES Datsets Options
+ES_DATASETS = {
+        'Elastic Documentation' : 'search-elastic-docs',
+        }
 
-class ContentHandlerFalcon(LLMContentHandler):
-        content_type = "application/json"
-        accepts = "application/json"
 
-        def transform_input(self, prompt: str, model_kwargs: dict) -> bytes:
-            input_str = json.dumps({"inputs": prompt, **model_kwargs})
-            return input_str.encode('utf-8')
+###cohere start
 
-        def transform_output(self, output: bytes) -> str:
-            response_json = json.loads(output.read().decode("utf-8"))
-            return response_json[0]["generated_text"]
+cohere_package = "cohere-gpt-medium-v1-8-081bb643f4ae3394a249d913abc6085c"
 
-class ContentHandlerFlan(LLMContentHandler):
-        content_type = "application/json"
-        accepts = "application/json"
+# Mapping for Model Packages
+model_package_map = {
+    "us-east-1": f"arn:aws:sagemaker:us-east-1:865070037744:model-package/{cohere_package}",
+    "us-east-2": f"arn:aws:sagemaker:us-east-2:057799348421:model-package/{cohere_package}",
+    "us-west-1": f"arn:aws:sagemaker:us-west-1:382657785993:model-package/{cohere_package}",
+    "us-west-2": f"arn:aws:sagemaker:us-west-2:594846645681:model-package/{cohere_package}",
+    "ca-central-1": f"arn:aws:sagemaker:ca-central-1:470592106596:model-package/{cohere_package}",
+    "eu-central-1": f"arn:aws:sagemaker:eu-central-1:446921602837:model-package/{cohere_package}",
+    "eu-west-1": f"arn:aws:sagemaker:eu-west-1:985815980388:model-package/{cohere_package}",
+    "eu-west-2": f"arn:aws:sagemaker:eu-west-2:856760150666:model-package/{cohere_package}",
+    "eu-west-3": f"arn:aws:sagemaker:eu-west-3:843114510376:model-package/{cohere_package}",
+    "eu-north-1": f"arn:aws:sagemaker:eu-north-1:136758871317:model-package/{cohere_package}",
+    "ap-southeast-1": f"arn:aws:sagemaker:ap-southeast-1:192199979996:model-package/{cohere_package}",
+    "ap-southeast-2": f"arn:aws:sagemaker:ap-southeast-2:666831318237:model-package/{cohere_package}",
+    "ap-northeast-2": f"arn:aws:sagemaker:ap-northeast-2:745090734665:model-package/{cohere_package}",
+    "ap-northeast-1": f"arn:aws:sagemaker:ap-northeast-1:977537786026:model-package/{cohere_package}",
+    "ap-south-1": f"arn:aws:sagemaker:ap-south-1:077584701553:model-package/{cohere_package}",
+    "sa-east-1": f"arn:aws:sagemaker:sa-east-1:270155090741:model-package/{cohere_package}",
+}
 
-        def transform_input(self, prompt: str, model_kwargs: dict) -> bytes:
-            input_str = json.dumps({"text_inputs": prompt, **model_kwargs})
-            return input_str.encode('utf-8')
+if aws_region not in model_package_map.keys():
+    raise Exception(f"Current boto3 session region {aws_region} is not supported.")
 
-        def transform_output(self, output: bytes) -> str:
-            response_json = json.loads(output.read().decode("utf-8"))
-            return response_json["generated_texts"][0]
+model_package_arn = model_package_map[aws_region]
+
+co = Client(region_name=aws_region)
+co.connect_to_endpoint(endpoint_name=cohere_light_endpoint_name)
+
+##cohere end
+
+
+LLM_LIST: List[str] = ["Cohere-light"]
 
 
 # Connect to Elastic Cloud cluster
@@ -58,13 +79,11 @@ def es_connect(cid, user, passwd):
     return es
 
 # Search ElasticSearch index and return body and URL of the result
-def search(query_text):
+def search(query_text, index_name):
 
-
+    
     print("Query text is", query_text)
     es = es_connect(cid, cu, cp)
-
-
 
     # Elasticsearch query (BM25) and kNN configuration for hybrid search
     query = {
@@ -86,7 +105,7 @@ def search(query_text):
         "num_candidates": 20,
         "query_vector_builder": {
             "text_embedding": {
-                "model_id": "1",
+                "model_id": "sentence-transformers__all-distilroberta-v1",
                 "model_text": query_text
             }
         },
@@ -94,7 +113,7 @@ def search(query_text):
     }
 
     fields = ["title", "body_content", "url"]
-    index = elastic_index
+    index = index_name
     resp = es.search(index=index,
                      query=query,
                      knn=knn,
@@ -102,90 +121,111 @@ def search(query_text):
                      size=1,
                      source=False)
 
-    print("Query is", query)
-    print("Response is",resp)
     body = resp['hits']['hits'][0]['fields']['body_content'][0]
     url = resp['hits']['hits'][0]['fields']['url'][0]
-
-    print("Body is",body)
-    print("URL is",url)
 
     return body, url
 
 def truncate_text(text, max_tokens):
     tokens = text.split()
-    print('Number of tokens',len(tokens))
-    if len(tokens) < max_tokens:
+    if len(tokens) <= max_tokens:
         return text
 
-    print('Number of tokens after truncation',len(tokens[:512]))
-
-    return ' '.join(tokens[:512])
+    return ' '.join(tokens[:max_tokens])
 
 
+def toLLM(query,
+        llm_model,
+        index=False,
+    ):
 
-st.title("Anycompany AI Assistant")
+    # Set prompt and add ES contest if required
+    if index:
+        resp, url = search(query, ES_DATASETS[es_index])
+        resp = truncate_text(resp, max_context_tokens - max_tokens - safety_margin)
+        prompt = f"Answer this question: {query}\n using only the information from this Elastic Doc: {resp}"
+        with st.expander("Source Document From Elasticsearch"):
+            st.markdown(resp)
+    else:
+        prompt = f"Answer this question: {query}"
+    print('prompt is: ',prompt)
 
-with st.sidebar.expander("⚙️", expanded=True):
+
+    # Call LLM
+    if llm_model == "Cohere-light":
+        response = co.generate(prompt=prompt, max_tokens=1024, temperature=0.9, return_likelihoods='GENERATION')
+        answer = response.generations[0].text
+    else:
+        answer = "Not available. Please select LLM"
+
+    print("Answer is",answer)
+
+    
+    # Print respose
+    if index:
+        if negResponse in answer:
+            st.markdown(f"AI: {answer.strip()}")
+        else:
+            st.markdown(f"AI: {answer.strip()}\n\nDocs: {url}")
+    else:
+        st.markdown(f"AI: {answer.strip()}")
+
+
+## Main
+st.set_page_config(
+     page_title="AI Assistant",
+     page_icon="🧠",
+#     layout="wide"
+)
+
+
+st.sidebar.markdown("""
+ <style>
+     [data-testid=stSidebar] [data-testid=stImage]{
+         text-align: center;
+         display: block;
+         margin-left: auto;
+         margin-right: auto;
+         width: 100%;
+     }
+ </style>
+ """, unsafe_allow_html=True)
+
+st.title("ElasticAWSJam AI Assistant")
+
+with st.sidebar.expander("Assistant Options", expanded=True):
+    es_index = st.selectbox(label='Select Your Dataset for Context', options=ES_DATASETS.keys())
     llm_model = st.selectbox(label='Choose Large Language Model', options=LLM_LIST)
-    elastic_index = st.selectbox(label='Choose ElasticSearch Index', options=INDEX_LIST)
-    with_context = st.checkbox('With Context')
 
 
 print("Selected LLM Model is:",llm_model)
-print("Selected Elastic Index is:",elastic_index)
-print("Selected Context Option is:",with_context)
 
-if llm_model == "Flan-T5-XXL":
-    endpoint_name = flan_t5_endpoint_name
-    content_handler = ContentHandlerFlan()
-elif llm_model == "Falcon-40B-Instruct":
-    endpoint_name = falcon_40b_endpoint_name
-    content_handler = ContentHandlerFalcon()
-else:
-    endpoint_name = "NA"
+# Streamlit Form
+st.markdown("""
+        <style>
+        .small-font {
+            font-size:12px !important;
+        }
+        </style>
+    """, unsafe_allow_html=True)
 
-# Main chat form
+st.markdown('<p class="small-font">Example Searches:</p>', unsafe_allow_html=True)
+st.markdown('<p class="small-font">Show me the API call for a redact processor<br>I want to secure my elastic cluster<br>run Elasticsearch with security enabled</p>', unsafe_allow_html=True)
 with st.form("chat_form"):
-    query = st.text_input("You: ")
-    submit_button = st.form_submit_button("Send")
+    query = st.text_input("What can I help you with: ")
+    b1, b2 = st.columns(2)
+    with b1:
+        search_no_context = st.form_submit_button("Search Without Context")
+    with b2:
+        search_context = st.form_submit_button("Search With Context")
+
 
 # Generate and display response on form submission
-negResponse = "I'm unable to answer the question based on the information I have from Elastic Docs."
-if submit_button:
-    resp, url = search(query)
-    print("Response before truncation:",resp)
-    resp = truncate_text(resp, max_context_tokens - max_tokens - safety_margin)
-    print("Response after truncation:",resp)
-    prompt_without_context = f"Answer this question: {query} \n"
-    prompt_with_context = f"Answer this question: {query}\nUsing only the information from this Elastic Doc: {resp}\n"
+negResponse = "I'm unable to answer the question based on the information I have from Context."
 
-    prompt = prompt_without_context
+if search_no_context:
+    toLLM(query, llm_model)
 
-    if with_context:
-        prompt = prompt_with_context
-    #answer = chat_gpt(prompt)
+if search_context:
+    toLLM(query, llm_model, ES_DATASETS[es_index])
 
-    ####adding here
-    #content_handler = ContentHandler()
-
-
-    llm=SagemakerEndpoint(
-            endpoint_name=endpoint_name,
-            #region_name="us-east-1",
-            region_name=aws_region,
-            model_kwargs={"temperature":1, "max_length": 2048},
-            content_handler=content_handler
-        )
-    answer = llm(prompt)
-    print("Answer is",answer)
-
-    ####stopping here
-
-    if negResponse in answer:
-        st.write(f"AI: {answer.strip()}")
-    else:
-        if with_context:
-            st.write(f"AI: {answer.strip()}\n\nDocs: {url}")
-        else:
-            st.write(f"AI: {answer.strip()}\n")
